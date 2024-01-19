@@ -13,6 +13,7 @@ mod http1;
 mod http2;
 mod memcache;
 mod momento;
+mod momento_ws;
 mod ping;
 mod redis;
 
@@ -40,6 +41,9 @@ pub fn launch_clients(config: &Config, work_receiver: Receiver<WorkItem>) -> Opt
         }
         Protocol::Momento => {
             clients::momento::launch_tasks(&mut client_rt, config.clone(), work_receiver)
+        }
+        Protocol::MomentoWs => {
+            clients::momento_ws::launch_tasks(&mut client_rt, config.clone(), work_receiver)
         }
         Protocol::Ping => {
             clients::ping::launch_tasks(&mut client_rt, config.clone(), work_receiver)

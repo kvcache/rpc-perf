@@ -8,6 +8,7 @@ pub enum Protocol {
     Http2,
     Memcache,
     Momento,
+    MomentoWs,
     Ping,
     Resp,
     Kafka,
