@@ -2,7 +2,7 @@ use std::{pin::{Pin, pin}, task::{Context, Poll}, collections::VecDeque, sync::{
 
 use futures::{StreamExt, Future, Stream, Sink, SinkExt};
 use prost::Message;
-use ringlog::error;
+use ringlog::{error, debug, trace};
 use tokio::{task::JoinHandle, sync::{mpsc, oneshot}};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -12,7 +12,6 @@ use super::websocket;
 pub struct MomentoWsClient {
     handle: JoinHandle<()>,
     command_sender: mpsc::Sender<NewCommand>,
-    request_id: AtomicUsize,
 }
 
 impl Drop for MomentoWsClient {
@@ -23,17 +22,31 @@ impl Drop for MomentoWsClient {
 
 impl MomentoWsClient {
     pub async fn new(url: String, cache: String, auth_token: String) -> Self {
+        debug!("making connection to {url}");
         let request = hyper::Request::builder()
-            .uri(url)
+            .uri(format!("{}/command_socket", url.replace("https", "wss")))
             .header("authorization", auth_token)
             .header("cache", cache)
             .header("content-encoding", "proto")
+
+            // a bunch of headers that tungstenite is dying without
+            .header("Sec-WebSocket-Key", "GMs4FwNEuRqrRZXUbv3zgQ==")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Host", url.replace("https://", ""))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+
             .body(())
             .expect("must be able to create a valid request");
 
         let config = WebSocketConfig::default();
 
-        let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), true).await.expect("must be able to connect");
+        let socket = match tokio_tungstenite::connect_async_with_config(request, Some(config), true).await {
+            Ok((socket, _)) => socket,
+            Err(e) => {
+                panic!("must be able to connect: {e:?}")
+            }
+        };
 
         let (command_sender, command_stream) = mpsc::channel(16);
         let handle = tokio::spawn(Socket { socket, command_stream, pending_commands: Default::default(), command_id: 0 });
@@ -41,15 +54,10 @@ impl MomentoWsClient {
         Self {
             handle,
             command_sender,
-            request_id: Default::default(),
         }
     }
 
-    pub fn next_request_id(&self) -> usize {
-        self.request_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub async fn send(&self, request: websocket::SocketRequest) -> Result<websocket::SocketResponse, Error> {
+    pub async fn send(&self, mut request: websocket::SocketRequest) -> Result<websocket::SocketResponse, Error> {
         let (response, receiver) = oneshot::channel();
         match self.command_sender.try_send(NewCommand { request, response }) {
             Ok(_) => (),
@@ -62,8 +70,12 @@ impl MomentoWsClient {
         }
 
         match receiver.await {
-            Ok(reply) => reply,
-            Err(_e) => {
+            Ok(reply) => {
+                trace!("got: {reply:?}");
+                reply
+            }
+            Err(e) => {
+                trace!("got: {e:?}");
                 Err(Error::Cancelled)
             }
         }
@@ -77,6 +89,7 @@ struct Socket {
     command_id: usize,
 }
 
+#[derive(Debug)]
 struct NewCommand {
     request: websocket::SocketRequest,
     response: oneshot::Sender<Result<websocket::SocketResponse, Error>>,
@@ -127,9 +140,12 @@ impl Future for Socket {
                 Poll::Ready(next) => {
                     match next {
                         Some(next) => {
-                            let NewCommand { request, response } = next;
+                            let NewCommand { mut request, response } = next;
                             let id = self.command_id;
                             self.command_id += 1;
+
+                            request.request_id = id as u64;
+
                             let message = tokio_tungstenite::tungstenite::Message::Binary(request.encode_to_vec());
                             self.pending_commands.push_back(PendingCommand { id, response });
 
@@ -154,6 +170,19 @@ impl Future for Socket {
             }
         }
         // we are now pending wake for room in the output OR new commands from the command_stream
+
+        match pin!(&mut self.socket).poll_flush(context) {
+            Poll::Ready(result) => {
+                match result {
+                    Ok(_) => (),
+                    Err(e) => {
+                        self.fail(Error::Socket(e.into()));
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            Poll::Pending => (),
+        }
 
         Poll::Pending
     }

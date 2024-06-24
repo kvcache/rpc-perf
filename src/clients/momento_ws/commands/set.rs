@@ -13,7 +13,7 @@ pub async fn set(
     match timeout(
         config.client().unwrap().request_timeout(),
         client.send(SocketRequest {
-            request_id: client.next_request_id() as u64,
+            request_id: 0,
             kind: Some(
                 socket_request::Kind::Cache(
                     CacheRequest {
